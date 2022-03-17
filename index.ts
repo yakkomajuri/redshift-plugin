@@ -66,9 +66,6 @@ export const setupPlugin: RedshiftPlugin['setupPlugin'] = async (meta) => {
         throw new Error('Cluster host must be a valid AWS Redshift host')
     }
 
-    // Max Redshift insert is 16 MB: https://docs.aws.amazon.com/redshift/latest/dg/c_redshift-sql.html
-    const uploadMegabytes = Math.max(1, Math.min(parseInt(config.uploadMegabytes) || 1, 10))
-    const uploadSeconds = Math.max(1, Math.min(parseInt(config.uploadSeconds) || 1, 600))
 
     global.sanitizedTableName = sanitizeSqlIdentifier(config.tableName)
 
@@ -94,67 +91,65 @@ export const setupPlugin: RedshiftPlugin['setupPlugin'] = async (meta) => {
         throw new Error(`Unable to connect to Redshift cluster and create table with error: ${queryError.message}`)
     }
 
-    global.buffer = createBuffer({
-        limit: uploadMegabytes * 1024 * 1024,
-        timeoutSeconds: uploadSeconds,
-        onFlush: async (batch) => {
-            await insertBatchIntoRedshift(
-                { batch, batchId: Math.floor(Math.random() * 1000000), retriesPerformedSoFar: 0 },
-                meta
-            )
-        },
-    })
-
     global.eventsToIgnore = new Set(
         config.eventsToIgnore ? config.eventsToIgnore.split(',').map((event) => event.trim()) : null
     )
 }
 
-export async function onEvent(event: PluginEvent, { global }: RedshiftMeta) {
-    const {
-        event: eventName,
-        properties,
-        $set,
-        $set_once,
-        distinct_id,
-        team_id,
-        site_url,
-        now,
-        sent_at,
-        uuid,
-        ..._discard
-    } = event
+export async function exportEvents(events: PluginEvent[], meta: RedshiftMeta) {
+    const batch = []
+    for (const event of events) {
+        const {
+            event: eventName,
+            properties,
+            $set,
+            $set_once,
+            distinct_id,
+            team_id,
+            site_url,
+            now,
+            sent_at,
+            uuid,
+            ..._discard
+        } = event
+    
+        const ip = properties?.['$ip'] || event.ip
+        const timestamp = event.timestamp || properties?.timestamp || now || sent_at
+        let ingestedProperties = properties
+        let elements = []
+    
+        // only move prop to elements for the $autocapture action
+        if (eventName === '$autocapture' && properties && '$elements' in properties) {
+            const { $elements, ...props } = properties
+            ingestedProperties = props
+            elements = $elements
+        }
+    
+        const parsedEvent = {
+            uuid,
+            eventName,
+            properties: JSON.stringify(ingestedProperties || {}),
+            elements: JSON.stringify(elements || {}),
+            set: JSON.stringify($set || {}),
+            set_once: JSON.stringify($set_once || {}),
+            distinct_id,
+            team_id,
+            ip,
+            site_url,
+            timestamp: new Date(timestamp).toISOString(),
+        }
 
-    const ip = properties?.['$ip'] || event.ip
-    const timestamp = event.timestamp || properties?.timestamp || now || sent_at
-    let ingestedProperties = properties
-    let elements = []
+        batch.push(parsedEvent)
 
-    // only move prop to elements for the $autocapture action
-    if (eventName === '$autocapture' && properties && '$elements' in properties) {
-        const { $elements, ...props } = properties
-        ingestedProperties = props
-        elements = $elements
     }
 
-    const parsedEvent = {
-        uuid,
-        eventName,
-        properties: JSON.stringify(ingestedProperties || {}),
-        elements: JSON.stringify(elements || {}),
-        set: JSON.stringify($set || {}),
-        set_once: JSON.stringify($set_once || {}),
-        distinct_id,
-        team_id,
-        ip,
-        site_url,
-        timestamp: new Date(timestamp).toISOString(),
-    }
+    await insertBatchIntoRedshift(
+        { batch, batchId: Math.floor(Math.random() * 1000000), retriesPerformedSoFar: 0 },
+        meta
+    )
 
-    if (!global.eventsToIgnore.has(eventName)) {
-        global.buffer.add(parsedEvent)
-    }
 }
+
 
 export const insertBatchIntoRedshift = async (payload: UploadJobPayload, { global, jobs, config }: RedshiftMeta) => {
     let values: InsertQueryValue[] = []
@@ -183,6 +178,7 @@ export const insertBatchIntoRedshift = async (payload: UploadJobPayload, { globa
         } to RedShift`
     )
 
+
     const queryError = await executeQuery(
         `INSERT INTO ${global.sanitizedTableName} (uuid, event, properties, elements, set, set_once, distinct_id, team_id, ip, site_url, timestamp)
         VALUES ${valuesString}`,
@@ -192,10 +188,10 @@ export const insertBatchIntoRedshift = async (payload: UploadJobPayload, { globa
 
     if (queryError) {
         console.error(`(Batch Id: ${payload.batchId}) Error uploading to Redshift: ${queryError.message}`)
-        if (payload.retriesPerformedSoFar >= 15) {
+        if (payload.retriesPerformedSoFar >= 5) {
             return
         }
-        const nextRetryMs = 2 ** payload.retriesPerformedSoFar * 3000
+        const nextRetryMs = 2 ** payload.retriesPerformedSoFar * 5000
         console.log(`Enqueued batch ${payload.batchId} for retry in ${nextRetryMs}ms`)
         await jobs
             .uploadBatchToRedshift({
@@ -204,6 +200,7 @@ export const insertBatchIntoRedshift = async (payload: UploadJobPayload, { globa
             })
             .runIn(nextRetryMs, 'milliseconds')
     }
+
 }
 
 const executeQuery = async (query: string, values: any[], config: RedshiftMeta['config']): Promise<Error | null> => {
@@ -226,10 +223,6 @@ const executeQuery = async (query: string, values: any[], config: RedshiftMeta['
     }
 
     return error
-}
-
-export const teardownPlugin: RedshiftPlugin['teardownPlugin'] = ({ global }) => {
-    global.buffer.flush()
 }
 
 const sanitizeSqlIdentifier = (unquotedIdentifier: string): string => {
